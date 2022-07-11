@@ -27,6 +27,15 @@ vmalert-ppc64le-prod:
 vmalert-386-prod:
 	APP_NAME=vmalert $(MAKE) app-via-docker-386
 
+vmalert-darwin-amd64-prod:
+	APP_NAME=vmalert $(MAKE) app-via-docker-darwin-amd64
+
+vmalert-darwin-arm64-prod:
+	APP_NAME=vmalert $(MAKE) app-via-docker-darwin-arm64
+
+vmalert-windows-amd64-prod:
+	APP_NAME=vmalert $(MAKE) app-via-docker-windows-amd64
+
 package-vmalert:
 	APP_NAME=vmalert $(MAKE) package-via-docker
 
@@ -53,13 +62,14 @@ publish-vmalert:
 
 test-vmalert:
 	go test -v -race -cover ./app/vmalert -loggerLevel=ERROR
+	go test -v -race -cover ./app/vmalert/templates
 	go test -v -race -cover ./app/vmalert/datasource
 	go test -v -race -cover ./app/vmalert/notifier
 	go test -v -race -cover ./app/vmalert/config
 	go test -v -race -cover ./app/vmalert/remotewrite
 
 run-vmalert: vmalert
-	./bin/vmalert -rule=app/vmalert/config/testdata/rules2-good.rules \
+	./bin/vmalert -rule=app/vmalert/config/testdata/rules/rules2-good.rules \
 		-datasource.url=http://localhost:8428 \
 		-notifier.url=http://localhost:9093 \
 		-notifier.url=http://127.0.0.1:9093 \
@@ -68,10 +78,17 @@ run-vmalert: vmalert
 		-external.label=cluster=east-1 \
 		-external.label=replica=a \
 		-evaluationInterval=3s \
-		-rule.configCheckInterval=10s
+		-configCheckInterval=10s
+
+run-vmalert-sd: vmalert
+	./bin/vmalert -rule=app/vmalert/config/testdata/rules2-good.rules \
+		-datasource.url=http://localhost:8428 \
+		-remoteWrite.url=http://localhost:8428 \
+		-notifier.config=app/vmalert/notifier/testdata/mixed.good.yaml \
+		-configCheckInterval=10s
 
 replay-vmalert: vmalert
-	./bin/vmalert -rule=app/vmalert/config/testdata/rules-replay-good.rules \
+	./bin/vmalert -rule=app/vmalert/config/testdata/rules/rules-replay-good.rules \
 		-datasource.url=http://localhost:8428 \
 		-remoteWrite.url=http://localhost:8428 \
 		-external.label=cluster=east-1 \
@@ -102,6 +119,3 @@ vmalert-pure:
 
 vmalert-windows-amd64:
 	GOARCH=amd64 APP_NAME=vmalert $(MAKE) app-local-windows-with-goarch
-
-vmalert-windows-amd64-prod:
-	APP_NAME=vmalert $(MAKE) app-via-docker-windows-amd64

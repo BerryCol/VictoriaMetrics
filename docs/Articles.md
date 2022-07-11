@@ -1,5 +1,5 @@
 ---
-sort: 16
+sort: 17
 ---
 
 # Articles
@@ -8,6 +8,8 @@ See also [case studies](https://docs.victoriametrics.com/CaseStudies.html).
 
 ## Third-party articles and slides about VictoriaMetrics
 
+* [Optimizing the Storage of Large Volumes of Metrics for a Long Time in VictoriaMetrics](https://percona.community/blog/2022/06/02/long-time-keeping-metrics-victoriametrics/)
+* [Announcing Asserts](https://www.asserts.ai/blog/announcing-asserts/)
 * [Choosing a Time Series Database for High Cardinality Aggregations](https://abiosgaming.com/press/high-cardinality-aggregations/)
 * [Scaling to trillions of metric data points](https://engineering.razorpay.com/scaling-to-trillions-of-metric-data-points-f569a5b654f2)
 * [VictoriaMetrics vs. OpenTSDB](https://blg.robot-house.us/posts/tsdbs-grow/)
@@ -48,6 +50,7 @@ See also [case studies](https://docs.victoriametrics.com/CaseStudies.html).
 * [Push Prometheus metrics to VictoriaMetrics or other exporters](https://pythonawesome.com/push-prometheus-metrics-to-victoriametrics-or-other-exporters/)
 * [Install and configure VictoriaMetrics on Debian](https://www.vultr.com/docs/install-and-configure-victoriametrics-on-debian)
 * [Superset BI with Victoria Metrics](https://cer6erus.medium.com/superset-bi-with-victoria-metrics-a109d3e91bc6)
+* [VictoriaMetrics Source Code Analysis - Bloom filter](https://www.sobyte.net/post/2022-05/victoriametrics-bloomfilter/)
 
 ## Our articles
 
@@ -57,7 +60,6 @@ See also [case studies](https://docs.victoriametrics.com/CaseStudies.html).
 * [Open-sourcing VictoriaMetrics](https://blog.usejournal.com/open-sourcing-victoriametrics-f31e34485c2b)
 * [VictoriaMetrics — creating the best remote storage for Prometheus](https://faun.pub/victoriametrics-creating-the-best-remote-storage-for-prometheus-5d92d66787ac)
 * [Anomaly Detection in VictoriaMetrics](https://victoriametrics.medium.com/anomaly-detection-in-victoriametrics-9528538786a7)
-
 
 ### Benchmarks
 
@@ -69,7 +71,6 @@ See also [case studies](https://docs.victoriametrics.com/CaseStudies.html).
 * [First look at performance comparison between InfluxDB IOx and VictoriaMetrics](https://victoriametrics.medium.com/first-look-at-perfomance-comparassion-between-influxdb-iox-and-victoriametrics-e590f847935b)
 * [Prometheus vs VictoriaMetrics benchmark on node-exporter metrics](https://valyala.medium.com/prometheus-vs-victoriametrics-benchmark-on-node-exporter-metrics-4ca29c75590f)
 * [Promscale vs VictoriaMetrics: resource usage on production workload](https://valyala.medium.com/promscale-vs-victoriametrics-resource-usage-on-production-workload-91c8e3786c03)
-
 
 ### Technical articles
 
@@ -83,7 +84,6 @@ See also [case studies](https://docs.victoriametrics.com/CaseStudies.html).
 * [Why irate from Prometheus doesn't capture spikes](https://valyala.medium.com/why-irate-from-prometheus-doesnt-capture-spikes-45f9896d7832)
 * [VictoriaMetrics: PromQL compliance](https://medium.com/@romanhavronenko/victoriametrics-promql-compliance-d4318203f51e)
 
-
 ### Tutorials, guides and how-to articles
 
 * [PromQL tutorial for beginners and humans](https://valyala.medium.com/promql-tutorial-for-beginners-9ab455142085)
@@ -95,7 +95,6 @@ See also [case studies](https://docs.victoriametrics.com/CaseStudies.html).
 * [How to use relabeling in Prometheus and VictoriaMetrics](https://valyala.medium.com/how-to-use-relabeling-in-prometheus-and-victoriametrics-8b90fc22c4b2)
 * [How to monitor Go applications with VictoriaMetrics](https://victoriametrics.medium.com/how-to-monitor-go-applications-with-victoriametrics-c04703110870)
 * [Prometheus storage: tech terms for humans](https://valyala.medium.com/prometheus-storage-technical-terms-for-humans-4ab4de6c3d48)
-
 
 ### Other articles
 

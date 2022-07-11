@@ -24,20 +24,18 @@ type VMStorage struct {
 	dataSourceType     Type
 	evaluationInterval time.Duration
 	extraParams        url.Values
-	disablePathAppend  bool
 }
 
 // Clone makes clone of VMStorage, shares http client.
 func (s *VMStorage) Clone() *VMStorage {
 	return &VMStorage{
-		c:                 s.c,
-		authCfg:           s.authCfg,
-		datasourceURL:     s.datasourceURL,
-		lookBack:          s.lookBack,
-		queryStep:         s.queryStep,
-		appendTypePrefix:  s.appendTypePrefix,
-		dataSourceType:    s.dataSourceType,
-		disablePathAppend: s.disablePathAppend,
+		c:                s.c,
+		authCfg:          s.authCfg,
+		datasourceURL:    s.datasourceURL,
+		lookBack:         s.lookBack,
+		queryStep:        s.queryStep,
+		appendTypePrefix: s.appendTypePrefix,
+		dataSourceType:   s.dataSourceType,
 	}
 }
 
@@ -57,27 +55,25 @@ func (s *VMStorage) BuildWithParams(params QuerierParams) Querier {
 }
 
 // NewVMStorage is a constructor for VMStorage
-func NewVMStorage(baseURL string, authCfg *promauth.Config, lookBack time.Duration, queryStep time.Duration, appendTypePrefix bool, c *http.Client, disablePathAppend bool) *VMStorage {
+func NewVMStorage(baseURL string, authCfg *promauth.Config, lookBack time.Duration, queryStep time.Duration, appendTypePrefix bool, c *http.Client) *VMStorage {
 	return &VMStorage{
-		c:                 c,
-		authCfg:           authCfg,
-		datasourceURL:     strings.TrimSuffix(baseURL, "/"),
-		appendTypePrefix:  appendTypePrefix,
-		lookBack:          lookBack,
-		queryStep:         queryStep,
-		dataSourceType:    NewPrometheusType(),
-		disablePathAppend: disablePathAppend,
+		c:                c,
+		authCfg:          authCfg,
+		datasourceURL:    strings.TrimSuffix(baseURL, "/"),
+		appendTypePrefix: appendTypePrefix,
+		lookBack:         lookBack,
+		queryStep:        queryStep,
+		dataSourceType:   NewPrometheusType(),
 	}
 }
 
 // Query executes the given query and returns parsed response
-func (s *VMStorage) Query(ctx context.Context, query string) ([]Metric, error) {
+func (s *VMStorage) Query(ctx context.Context, query string, ts time.Time) ([]Metric, error) {
 	req, err := s.newRequestPOST()
 	if err != nil {
 		return nil, err
 	}
 
-	ts := time.Now()
 	switch s.dataSourceType.String() {
 	case "prometheus":
 		s.setPrometheusInstantReqParams(req, query, ts)
@@ -150,9 +146,7 @@ func (s *VMStorage) newRequestPOST() (*http.Request, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if s.authCfg != nil {
-		if auth := s.authCfg.GetAuthHeader(); auth != "" {
-			req.Header.Set("Authorization", auth)
-		}
+		s.authCfg.SetHeaders(req, true)
 	}
 	return req, nil
 }

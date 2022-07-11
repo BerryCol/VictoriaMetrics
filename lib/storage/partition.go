@@ -65,7 +65,7 @@ const finalPartsToMerge = 3
 // The number of shards for rawRow entries per partition.
 //
 // Higher number of shards reduces CPU contention and increases the max bandwidth on multi-core systems.
-var rawRowsShardsPerPartition = (cgroup.AvailableCPUs() + 7) / 8
+var rawRowsShardsPerPartition = (cgroup.AvailableCPUs() + 3) / 4
 
 // getMaxRawRowsPerShard returns the maximum number of rows that haven't been converted into parts yet.
 func getMaxRawRowsPerShard() int {
@@ -125,6 +125,10 @@ type partition struct {
 	// data retention in milliseconds.
 	// Used for deleting data outside the retention during background merge.
 	retentionMsecs int64
+
+	// Whether the storage is in read-only mode.
+	// Background merge is stopped in read-only mode.
+	isReadOnly *uint32
 
 	// Name is the name of the partition in the form YYYY_MM.
 	name string
@@ -199,7 +203,8 @@ func (pw *partWrapper) decRef() {
 
 // createPartition creates new partition for the given timestamp and the given paths
 // to small and big partitions.
-func createPartition(timestamp int64, smallPartitionsPath, bigPartitionsPath string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64) (*partition, error) {
+func createPartition(timestamp int64, smallPartitionsPath, bigPartitionsPath string,
+	getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64, isReadOnly *uint32) (*partition, error) {
 	name := timestampToPartitionName(timestamp)
 	smallPartsPath := filepath.Clean(smallPartitionsPath) + "/" + name
 	bigPartsPath := filepath.Clean(bigPartitionsPath) + "/" + name
@@ -212,7 +217,7 @@ func createPartition(timestamp int64, smallPartitionsPath, bigPartitionsPath str
 		return nil, fmt.Errorf("cannot create directories for big parts %q: %w", bigPartsPath, err)
 	}
 
-	pt := newPartition(name, smallPartsPath, bigPartsPath, getDeletedMetricIDs, retentionMsecs)
+	pt := newPartition(name, smallPartsPath, bigPartsPath, getDeletedMetricIDs, retentionMsecs, isReadOnly)
 	pt.tr.fromPartitionTimestamp(timestamp)
 	pt.startMergeWorkers()
 	pt.startRawRowsFlusher()
@@ -238,7 +243,7 @@ func (pt *partition) Drop() {
 }
 
 // openPartition opens the existing partition from the given paths.
-func openPartition(smallPartsPath, bigPartsPath string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64) (*partition, error) {
+func openPartition(smallPartsPath, bigPartsPath string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64, isReadOnly *uint32) (*partition, error) {
 	smallPartsPath = filepath.Clean(smallPartsPath)
 	bigPartsPath = filepath.Clean(bigPartsPath)
 
@@ -262,7 +267,7 @@ func openPartition(smallPartsPath, bigPartsPath string, getDeletedMetricIDs func
 		return nil, fmt.Errorf("cannot open big parts from %q: %w", bigPartsPath, err)
 	}
 
-	pt := newPartition(name, smallPartsPath, bigPartsPath, getDeletedMetricIDs, retentionMsecs)
+	pt := newPartition(name, smallPartsPath, bigPartsPath, getDeletedMetricIDs, retentionMsecs, isReadOnly)
 	pt.smallParts = smallParts
 	pt.bigParts = bigParts
 	if err := pt.tr.fromPartitionName(name); err != nil {
@@ -276,7 +281,7 @@ func openPartition(smallPartsPath, bigPartsPath string, getDeletedMetricIDs func
 	return pt, nil
 }
 
-func newPartition(name, smallPartsPath, bigPartsPath string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64) *partition {
+func newPartition(name, smallPartsPath, bigPartsPath string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64, isReadOnly *uint32) *partition {
 	p := &partition{
 		name:           name,
 		smallPartsPath: smallPartsPath,
@@ -284,6 +289,7 @@ func newPartition(name, smallPartsPath, bigPartsPath string, getDeletedMetricIDs
 
 		getDeletedMetricIDs: getDeletedMetricIDs,
 		retentionMsecs:      retentionMsecs,
+		isReadOnly:          isReadOnly,
 
 		mergeIdx: uint64(time.Now().UnixNano()),
 		stopCh:   make(chan struct{}),
@@ -481,7 +487,7 @@ func (rrs *rawRowsShard) addRows(pt *partition, rows []rawRow) {
 
 func (pt *partition) flushRowsToParts(rows []rawRow) {
 	maxRows := getMaxRawRowsPerShard()
-	var wg sync.WaitGroup
+	wg := getWaitGroup()
 	for len(rows) > 0 {
 		n := maxRows
 		if n > len(rows) {
@@ -495,7 +501,22 @@ func (pt *partition) flushRowsToParts(rows []rawRow) {
 		rows = rows[n:]
 	}
 	wg.Wait()
+	putWaitGroup(wg)
 }
+
+func getWaitGroup() *sync.WaitGroup {
+	v := wgPool.Get()
+	if v == nil {
+		return &sync.WaitGroup{}
+	}
+	return v.(*sync.WaitGroup)
+}
+
+func putWaitGroup(wg *sync.WaitGroup) {
+	wgPool.Put(wg)
+}
+
+var wgPool sync.Pool
 
 func (pt *partition) addRowsPart(rows []rawRow) {
 	if len(rows) == 0 {
@@ -815,8 +836,7 @@ func (pt *partition) ForceMergeAllParts() error {
 	maxOutBytes := fs.MustGetFreeSpace(pt.bigPartsPath)
 	if newPartSize > maxOutBytes {
 		freeSpaceNeededBytes := newPartSize - maxOutBytes
-		logger.WithThrottler("forceMerge", time.Minute).Warnf("cannot initiate force merge for the partition %s; additional space needed: %d bytes",
-			pt.name, freeSpaceNeededBytes)
+		forceMergeLogger.Warnf("cannot initiate force merge for the partition %s; additional space needed: %d bytes", pt.name, freeSpaceNeededBytes)
 		return nil
 	}
 
@@ -826,6 +846,8 @@ func (pt *partition) ForceMergeAllParts() error {
 	}
 	return nil
 }
+
+var forceMergeLogger = logger.WithThrottler("forceMerge", time.Minute)
 
 func appendAllPartsToMerge(dst, src []*partWrapper) []*partWrapper {
 	for _, pw := range src {
@@ -848,9 +870,17 @@ func hasActiveMerges(pws []*partWrapper) bool {
 }
 
 var (
-	bigMergeWorkersCount   = (cgroup.AvailableCPUs() + 1) / 2
-	smallMergeWorkersCount = (cgroup.AvailableCPUs() + 1) / 2
+	bigMergeWorkersCount   = getDefaultMergeConcurrency(4)
+	smallMergeWorkersCount = getDefaultMergeConcurrency(8)
 )
+
+func getDefaultMergeConcurrency(max int) int {
+	v := (cgroup.AvailableCPUs() + 1) / 2
+	if v > max {
+		v = max
+	}
+	return v
+}
 
 // SetBigMergeWorkersCount sets the maximum number of concurrent mergers for big blocks.
 //
@@ -978,7 +1008,16 @@ func getMaxOutBytes(path string, workersCount int) uint64 {
 	return maxOutBytes
 }
 
+func (pt *partition) canBackgroundMerge() bool {
+	return atomic.LoadUint32(pt.isReadOnly) == 0
+}
+
 func (pt *partition) mergeBigParts(isFinal bool) error {
+	if !pt.canBackgroundMerge() {
+		// Do not perform merge in read-only mode, since this may result in disk space shortage.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2603
+		return nil
+	}
 	maxOutBytes := getMaxOutBytes(pt.bigPartsPath, bigMergeWorkersCount)
 
 	pt.partsLock.Lock()
@@ -990,6 +1029,11 @@ func (pt *partition) mergeBigParts(isFinal bool) error {
 }
 
 func (pt *partition) mergeSmallParts(isFinal bool) error {
+	if !pt.canBackgroundMerge() {
+		// Do not perform merge in read-only mode, since this may result in disk space shortage.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2603
+		return nil
+	}
 	// Try merging small parts to a big part at first.
 	maxBigPartOutBytes := getMaxOutBytes(pt.bigPartsPath, bigMergeWorkersCount)
 	pt.partsLock.Lock()
@@ -1255,6 +1299,13 @@ func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}) erro
 
 func getCompressLevelForRowsCount(rowsCount, blocksCount uint64) int {
 	avgRowsPerBlock := rowsCount / blocksCount
+	// See https://github.com/facebook/zstd/releases/tag/v1.3.4 about negative compression levels.
+	if avgRowsPerBlock <= 10 {
+		return -5
+	}
+	if avgRowsPerBlock <= 50 {
+		return -2
+	}
 	if avgRowsPerBlock <= 200 {
 		return -1
 	}

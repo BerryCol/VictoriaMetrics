@@ -185,7 +185,7 @@ func TestConvertToCompositeTagFilters(t *testing.T) {
 				IsRegexp:   false,
 			},
 			{
-				Key:        []byte("\xfe\x03barfoo"),
+				Key:        []byte("foo"),
 				Value:      []byte("abc"),
 				IsNegative: true,
 				IsRegexp:   false,
@@ -588,21 +588,7 @@ func TestConvertToCompositeTagFilters(t *testing.T) {
 				IsRegexp:   true,
 			},
 			{
-				Key:        []byte("\xfe\x03barfoo"),
-				Value:      []byte("abc"),
-				IsNegative: true,
-				IsRegexp:   false,
-			},
-		},
-		{
-			{
-				Key:        nil,
-				Value:      []byte("bar|foo"),
-				IsNegative: false,
-				IsRegexp:   true,
-			},
-			{
-				Key:        []byte("\xfe\x03foofoo"),
+				Key:        []byte("foo"),
 				Value:      []byte("abc"),
 				IsNegative: true,
 				IsRegexp:   false,
@@ -1277,7 +1263,7 @@ func TestTagFiltersString(t *testing.T) {
 	mustAdd("tag_n", "n_value", true, false)
 	mustAdd("tag_re_graphite", "foo\\.bar", false, true)
 	s := tfs.String()
-	sExpected := `{__name__="metric_name", tag_re=~"re.value", tag_nre!~"nre.value", tag_n!="n_value", tag_re_graphite="foo.bar"}`
+	sExpected := `{__name__="metric_name",tag_re=~"re.value",tag_nre!~"nre.value",tag_n!="n_value",tag_re_graphite="foo.bar"}`
 	if s != sExpected {
 		t.Fatalf("unexpected TagFilters.String(); got %q; want %q", s, sExpected)
 	}

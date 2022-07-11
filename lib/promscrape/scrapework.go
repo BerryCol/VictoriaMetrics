@@ -3,6 +3,7 @@ package promscrape
 import (
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"math"
 	"math/bits"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/leveledbytebufferpool"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -24,12 +26,15 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool"
 	"github.com/VictoriaMetrics/metrics"
-	xxhash "github.com/cespare/xxhash/v2"
+	"github.com/cespare/xxhash/v2"
 )
 
 var (
 	suppressScrapeErrors = flag.Bool("promscrape.suppressScrapeErrors", false, "Whether to suppress scrape errors logging. "+
-		"The last error for each target is always available at '/targets' page even if scrape errors logging is suppressed")
+		"The last error for each target is always available at '/targets' page even if scrape errors logging is suppressed. "+
+		"See also -promscrape.suppressScrapeErrorsDelay")
+	suppressScrapeErrorsDelay = flag.Duration("promscrape.suppressScrapeErrorsDelay", 0, "The delay for suppressing repeated scrape errors logging per each scrape targets. "+
+		"This may be used for reducing the number of log lines related to scrape errors. See also -promscrape.suppressScrapeErrors")
 	noStaleMarkers                = flag.Bool("promscrape.noStaleMarkers", false, "Whether to disable sending Prometheus stale markers for metrics when scrape target disappears. This option may reduce memory usage if stale markers aren't needed for your setup. This option also disables populating the scrape_series_added metric. See https://prometheus.io/docs/concepts/jobs_instances/#automatically-generated-labels-and-time-series")
 	seriesLimitPerTarget          = flag.Int("promscrape.seriesLimitPerTarget", 0, "Optional limit on the number of unique time series a single scrape target can expose. See https://docs.victoriametrics.com/vmagent.html#cardinality-limiter for more info")
 	minResponseSizeForStreamParse = flagutil.NewBytes("promscrape.minResponseSizeForStreamParse", 1e6, "The minimum target response size for automatic switching to stream parsing mode, which can reduce memory usage. See https://docs.victoriametrics.com/vmagent.html#stream-parsing-mode")
@@ -220,6 +225,12 @@ type scrapeWork struct {
 	// in stream parsing mode in order to reduce memory usage when the lastScrape size
 	// equals to or exceeds -promscrape.minResponseSizeForStreamParse
 	lastScrapeCompressed []byte
+
+	// lastErrLogTimestamp is the timestamp in unix seconds of the last logged scrape error
+	lastErrLogTimestamp uint64
+
+	// errsSuppressedCount is the number of suppressed scrape errors since lastErrLogTimestamp
+	errsSuppressedCount int
 }
 
 func (sw *scrapeWork) loadLastScrape() string {
@@ -271,11 +282,16 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{}) 
 		// This also makes consistent scrape times across restarts
 		// for a target with the same ScrapeURL and labels.
 		//
-		// Include clusterMemberNum to the key in order to guarantee that each member in vmagent cluster
+		// Include clusterName to the key in order to guarantee that the same
+		// scrape target is scraped at different offsets per each cluster.
+		// This guarantees that the deduplication consistently leaves samples received from the same vmagent.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2679
+		//
+		// Include clusterMemberID to the key in order to guarantee that each member in vmagent cluster
 		// scrapes replicated targets at different time offsets. This guarantees that the deduplication consistently leaves samples
 		// received from the same vmagent replica.
 		// See https://docs.victoriametrics.com/vmagent.html#scraping-big-number-of-targets
-		key := fmt.Sprintf("ClusterMemberNum=%d, ScrapeURL=%s, Labels=%s", *clusterMemberNum, sw.Config.ScrapeURL, sw.Config.LabelsString())
+		key := fmt.Sprintf("clusterName=%s, clusterMemberID=%d, ScrapeURL=%s, Labels=%s", *clusterName, clusterMemberID, sw.Config.ScrapeURL, sw.Config.LabelsString())
 		h := xxhash.Sum64(bytesutil.ToUnsafeBytes(key))
 		randSleep = uint64(float64(scrapeInterval) * (float64(h) / (1 << 64)))
 		sleepOffset := uint64(time.Now().UnixNano()) % uint64(scrapeInterval)
@@ -316,7 +332,10 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{}) 
 				// Do not send staleness markers on graceful shutdown as Prometheus does.
 				// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2013#issuecomment-1006994079
 			default:
-				// Send staleness markers when the given target disappears.
+				// Send staleness markers to all the metrics scraped last time from the target
+				// when the given target disappears as Prometheus does.
+				// Use the current real timestamp for staleness markers, so queries
+				// stop returning data just after the time the target disappears.
 				sw.sendStaleSeries(lastScrape, "", t, true)
 			}
 			if sw.seriesLimiter != nil {
@@ -350,9 +369,22 @@ func (sw *scrapeWork) logError(s string) {
 }
 
 func (sw *scrapeWork) scrapeAndLogError(scrapeTimestamp, realTimestamp int64) {
-	if err := sw.scrapeInternal(scrapeTimestamp, realTimestamp); err != nil && !*suppressScrapeErrors {
-		logger.Errorf("error when scraping %q from job %q with labels %s: %s", sw.Config.ScrapeURL, sw.Config.Job(), sw.Config.LabelsString(), err)
+	err := sw.scrapeInternal(scrapeTimestamp, realTimestamp)
+	if err == nil {
+		return
 	}
+	d := time.Duration(fasttime.UnixTimestamp()-sw.lastErrLogTimestamp) * time.Second
+	if *suppressScrapeErrors || d < *suppressScrapeErrorsDelay {
+		sw.errsSuppressedCount++
+		return
+	}
+	err = fmt.Errorf("cannot scrape %q (job %q, labels %s): %w", sw.Config.ScrapeURL, sw.Config.Job(), sw.Config.LabelsString(), err)
+	if sw.errsSuppressedCount > 0 {
+		err = fmt.Errorf("%w; %d similar errors suppressed during the last %.1f seconds", err, sw.errsSuppressedCount, d.Seconds())
+	}
+	logger.Warnf("%s", err)
+	sw.lastErrLogTimestamp = fasttime.UnixTimestamp()
+	sw.errsSuppressedCount = 0
 }
 
 var (
@@ -369,6 +401,22 @@ func (sw *scrapeWork) mustSwitchToStreamParseMode(responseSize int) bool {
 		return false
 	}
 	return sw.Config.canSwitchToStreamParseMode() && responseSize >= minResponseSizeForStreamParse.N
+}
+
+// getTargetResponse() fetches response from sw target in the same way as when scraping the target.
+func (sw *scrapeWork) getTargetResponse() ([]byte, error) {
+	if *streamParse || sw.Config.StreamParse || sw.mustSwitchToStreamParseMode(sw.prevBodyLen) {
+		// Read the response in stream mode.
+		sr, err := sw.GetStreamReader()
+		if err != nil {
+			return nil, err
+		}
+		data, err := ioutil.ReadAll(sr)
+		sr.MustClose()
+		return data, err
+	}
+	// Read the response in usual mode.
+	return sw.ReadData(nil)
 }
 
 func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error {
@@ -434,6 +482,11 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 	sw.addAutoTimeseries(wc, "scrape_samples_post_metric_relabeling", float64(samplesPostRelabeling), scrapeTimestamp)
 	sw.addAutoTimeseries(wc, "scrape_series_added", float64(seriesAdded), scrapeTimestamp)
 	sw.addAutoTimeseries(wc, "scrape_timeout_seconds", sw.Config.ScrapeTimeout.Seconds(), scrapeTimestamp)
+	if sw.Config.SampleLimit > 0 {
+		// Expose scrape_samples_limit metric if sample_limt config is set for the target.
+		// See https://github.com/VictoriaMetrics/operator/issues/497
+		sw.addAutoTimeseries(wc, "scrape_samples_limit", float64(sw.Config.SampleLimit), scrapeTimestamp)
+	}
 	sw.pushData(&wc.writeRequest)
 	sw.prevLabelsLen = len(wc.labels)
 	sw.prevBodyLen = len(bodyString)
@@ -446,7 +499,9 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 	}
 	// body must be released only after wc is released, since wc refers to body.
 	if !areIdenticalSeries {
-		sw.sendStaleSeries(lastScrape, bodyString, scrapeTimestamp, false)
+		// Send stale markers for disappeared metrics with the real scrape timestamp
+		// in order to guarantee that query doesn't return data after this time for the disappeared metrics.
+		sw.sendStaleSeries(lastScrape, bodyString, realTimestamp, false)
 		sw.storeLastScrape(body.B)
 	}
 	sw.finalizeLastScrape()
@@ -455,7 +510,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 		// This should reduce memory usage when scraping targets which return big responses.
 		leveledbytebufferpool.Put(body)
 	}
-	tsmGlobal.Update(sw.Config, sw.ScrapeGroup, up == 1, realTimestamp, int64(duration*1000), samplesScraped, err)
+	tsmGlobal.Update(sw, up == 1, realTimestamp, int64(duration*1000), samplesScraped, err)
 	return err
 }
 
@@ -554,11 +609,13 @@ func (sw *scrapeWork) scrapeStream(scrapeTimestamp, realTimestamp int64) error {
 	wc.reset()
 	writeRequestCtxPool.Put(wc)
 	if !areIdenticalSeries {
-		sw.sendStaleSeries(lastScrape, bodyString, scrapeTimestamp, false)
+		// Send stale markers for disappeared metrics with the real scrape timestamp
+		// in order to guarantee that query doesn't return data after this time for the disappeared metrics.
+		sw.sendStaleSeries(lastScrape, bodyString, realTimestamp, false)
 		sw.storeLastScrape(sbr.body)
 	}
 	sw.finalizeLastScrape()
-	tsmGlobal.Update(sw.Config, sw.ScrapeGroup, up == 1, realTimestamp, int64(duration*1000), samplesScraped, err)
+	tsmGlobal.Update(sw, up == 1, realTimestamp, int64(duration*1000), samplesScraped, err)
 	// Do not track active series in streaming mode, since this may need too big amounts of memory
 	// when the target exports too big number of metrics.
 	return err
@@ -716,7 +773,7 @@ func (sw *scrapeWork) sendStaleSeries(lastScrape, currScrape string, timestamp i
 	sw.pushData(&wc.writeRequest)
 }
 
-var staleSamplesCreated = metrics.NewCounter(`promscrape_stale_samples_created_total`)
+var staleSamplesCreated = metrics.NewCounter(`vm_promscrape_stale_samples_created_total`)
 
 func (sw *scrapeWork) getLabelsHash(labels []prompbmarshal.Label) uint64 {
 	// It is OK if there will be hash collisions for distinct sets of labels,

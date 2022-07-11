@@ -124,6 +124,11 @@ func (tbf *tmpBlocksFile) WriteBlockRefData(b []byte) (tmpBlockAddr, error) {
 	return addr, nil
 }
 
+// Len() returnt tbf size in bytes.
+func (tbf *tmpBlocksFile) Len() uint64 {
+	return tbf.offset
+}
+
 func (tbf *tmpBlocksFile) Finalize() error {
 	if tbf.f == nil {
 		return nil
@@ -149,7 +154,7 @@ func (tbf *tmpBlocksFile) MustReadBlockRefAt(partRef storage.PartRef, addr tmpBl
 	} else {
 		bb := tmpBufPool.Get()
 		defer tmpBufPool.Put(bb)
-		bb.B = bytesutil.ResizeNoCopy(bb.B, addr.size)
+		bb.B = bytesutil.ResizeNoCopyMayOverallocate(bb.B, addr.size)
 		tbf.r.MustReadAt(bb.B, int64(addr.offset))
 		buf = bb.B
 	}

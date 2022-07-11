@@ -33,7 +33,7 @@ type apiConfig struct {
 	// tokenLock guards creds refresh
 	tokenLock sync.Mutex
 	creds     *apiCredentials
-	// authTokenReq contins request body for apiCredentials
+	// authTokenReq contains request body for apiCredentials
 	authTokenReq []byte
 	// keystone endpoint
 	endpoint   *url.URL
@@ -81,7 +81,11 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 		port:         sdc.Port,
 	}
 	if sdc.TLSConfig != nil {
-		ac, err := promauth.NewConfig(baseDir, nil, nil, "", "", nil, sdc.TLSConfig)
+		opts := &promauth.Options{
+			BaseDir:   baseDir,
+			TLSConfig: sdc.TLSConfig,
+		}
+		ac, err := opts.NewConfig()
 		if err != nil {
 			return nil, err
 		}

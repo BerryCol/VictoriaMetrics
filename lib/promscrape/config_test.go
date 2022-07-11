@@ -5,13 +5,158 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/gce"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 )
+
+func TestInternStringSerial(t *testing.T) {
+	if err := testInternString(t); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+}
+
+func TestInternStringConcurrent(t *testing.T) {
+	concurrency := 5
+	resultCh := make(chan error, concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			resultCh <- testInternString(t)
+		}()
+	}
+	timer := time.NewTimer(5 * time.Second)
+	for i := 0; i < concurrency; i++ {
+		select {
+		case err := <-resultCh:
+			if err != nil {
+				t.Fatalf("unexpected error: %s", err)
+			}
+		case <-timer.C:
+			t.Fatalf("timeout")
+		}
+	}
+}
+
+func testInternString(t *testing.T) error {
+	for i := 0; i < 1000; i++ {
+		s := fmt.Sprintf("foo_%d", i)
+		s1 := internString(s)
+		if s != s1 {
+			return fmt.Errorf("unexpected string returned from internString; got %q; want %q", s1, s)
+		}
+	}
+	return nil
+}
+
+func TestMergeLabels(t *testing.T) {
+	f := func(swc *scrapeWorkConfig, target string, extraLabels, metaLabels map[string]string, resultExpected string) {
+		t.Helper()
+		var labels []prompbmarshal.Label
+		labels = mergeLabels(labels[:0], swc, target, extraLabels, metaLabels)
+		result := promLabelsString(labels)
+		if result != resultExpected {
+			t.Fatalf("unexpected result;\ngot\n%s\nwant\n%s", result, resultExpected)
+		}
+	}
+	f(&scrapeWorkConfig{}, "foo", nil, nil, `{__address__="foo",__metrics_path__="",__scheme__="",__scrape_interval__="",__scrape_timeout__="",job=""}`)
+	f(&scrapeWorkConfig{}, "foo", map[string]string{"foo": "bar"}, nil, `{__address__="foo",__metrics_path__="",__scheme__="",__scrape_interval__="",__scrape_timeout__="",foo="bar",job=""}`)
+	f(&scrapeWorkConfig{}, "foo", map[string]string{"job": "bar"}, nil, `{__address__="foo",__metrics_path__="",__scheme__="",__scrape_interval__="",__scrape_timeout__="",job="bar"}`)
+	f(&scrapeWorkConfig{
+		jobName:              "xyz",
+		scheme:               "https",
+		metricsPath:          "/foo/bar",
+		scrapeIntervalString: "15s",
+		scrapeTimeoutString:  "10s",
+		externalLabels: map[string]string{
+			"job": "bar",
+			"a":   "b",
+		},
+	}, "foo", nil, nil, `{__address__="foo",__metrics_path__="/foo/bar",__scheme__="https",__scrape_interval__="15s",__scrape_timeout__="10s",a="b",job="xyz"}`)
+	f(&scrapeWorkConfig{
+		jobName:     "xyz",
+		scheme:      "https",
+		metricsPath: "/foo/bar",
+		externalLabels: map[string]string{
+			"job": "bar",
+			"a":   "b",
+		},
+	}, "foo", map[string]string{
+		"job": "extra_job",
+		"foo": "extra_foo",
+		"a":   "xyz",
+	}, map[string]string{
+		"__meta_x": "y",
+	}, `{__address__="foo",__meta_x="y",__metrics_path__="/foo/bar",__scheme__="https",__scrape_interval__="",__scrape_timeout__="",a="xyz",foo="extra_foo",job="extra_job"}`)
+}
+
+func TestScrapeConfigUnmarshalMarshal(t *testing.T) {
+	f := func(data string) {
+		t.Helper()
+		var cfg Config
+		data = strings.TrimSpace(data)
+		if err := cfg.unmarshal([]byte(data), true); err != nil {
+			t.Fatalf("parse error: %s\ndata:\n%s", err, data)
+		}
+		resultData := string(cfg.marshal())
+		result := strings.TrimSpace(resultData)
+		if result != data {
+			t.Fatalf("unexpected marshaled config:\ngot\n%s\nwant\n%s", result, data)
+		}
+	}
+	f(`
+global:
+  scrape_interval: 10s
+`)
+	f(`
+scrape_config_files:
+- foo
+- bar
+`)
+	f(`
+scrape_configs:
+- job_name: foo
+  scrape_timeout: 1.5s
+  static_configs:
+  - targets:
+    - foo
+    - bar
+    labels:
+      foo: bar
+`)
+	f(`
+scrape_configs:
+- job_name: foo
+  honor_labels: true
+  honor_timestamps: false
+  scheme: https
+  params:
+    foo:
+    - x
+  authorization:
+    type: foobar
+  headers:
+  - 'TenantID: fooBar'
+  - 'X: y:z'
+  relabel_configs:
+  - source_labels: [abc]
+  static_configs:
+  - targets:
+    - foo
+  relabel_debug: true
+  scrape_align_interval: 1h30m0s
+  proxy_bearer_token_file: file.txt
+  proxy_headers:
+  - 'My-Auth-Header: top-secret'
+`)
+
+}
 
 func TestNeedSkipScrapeWork(t *testing.T) {
 	f := func(key string, membersCount, replicationFactor, memberNum int, needSkipExpected bool) {
@@ -192,7 +337,7 @@ scrape_configs:
 		jobNameOriginal: "blackbox",
 	}}
 	if !reflect.DeepEqual(sws, swsExpected) {
-		t.Fatalf("unexpected scrapeWork;\ngot\n%+v\nwant\n%+v", sws, swsExpected)
+		t.Fatalf("unexpected scrapeWork;\ngot\n%#v\nwant\n%#v", sws, swsExpected)
 	}
 }
 
@@ -1510,12 +1655,31 @@ scrape_configs:
 			jobNameOriginal: "aaa",
 		},
 	})
+
+	opts := &promauth.Options{
+		Headers: []string{"My-Auth: foo-Bar"},
+	}
+	ac, err := opts.NewConfig()
+	if err != nil {
+		t.Fatalf("unexpected error when creating promauth.Config: %s", err)
+	}
+	opts = &promauth.Options{
+		Headers: []string{"Foo:bar"},
+	}
+	proxyAC, err := opts.NewConfig()
+	if err != nil {
+		t.Fatalf("unexpected error when creating promauth.Config for proxy: %s", err)
+	}
 	f(`
 scrape_configs:
   - job_name: 'snmp'
     sample_limit: 100
     disable_keepalive: true
     disable_compression: true
+    headers:
+    - "My-Auth: foo-Bar"
+    proxy_headers:
+    - "Foo: bar"
     scrape_align_interval: 1s
     scrape_offset: 0.5s
     static_configs:
@@ -1587,8 +1751,8 @@ scrape_configs:
 					Value: "snmp",
 				},
 			},
-			AuthConfig:          &promauth.Config{},
-			ProxyAuthConfig:     &promauth.Config{},
+			AuthConfig:          ac,
+			ProxyAuthConfig:     proxyAC,
 			SampleLimit:         100,
 			DisableKeepAlive:    true,
 			DisableCompression:  true,
@@ -1648,6 +1812,59 @@ scrape_configs:
 			ProxyAuthConfig: &promauth.Config{},
 		},
 	})
+	f(`
+global:
+  scrape_timeout: 1d
+scrape_configs:
+- job_name: foo
+  scrape_interval: 1w
+  scrape_align_interval: 1d
+  scrape_offset: 2d
+  static_configs:
+  - targets: ["foo.bar:1234"]
+`, []*ScrapeWork{
+		{
+			ScrapeURL:           "http://foo.bar:1234/metrics",
+			ScrapeInterval:      time.Hour * 24 * 7,
+			ScrapeTimeout:       time.Hour * 24,
+			ScrapeAlignInterval: time.Hour * 24,
+			ScrapeOffset:        time.Hour * 24 * 2,
+			HonorTimestamps:     true,
+			Labels: []prompbmarshal.Label{
+				{
+					Name:  "__address__",
+					Value: "foo.bar:1234",
+				},
+				{
+					Name:  "__metrics_path__",
+					Value: "/metrics",
+				},
+				{
+					Name:  "__scheme__",
+					Value: "http",
+				},
+				{
+					Name:  "__scrape_interval__",
+					Value: "168h0m0s",
+				},
+				{
+					Name:  "__scrape_timeout__",
+					Value: "24h0m0s",
+				},
+				{
+					Name:  "instance",
+					Value: "foo.bar:1234",
+				},
+				{
+					Name:  "job",
+					Value: "foo",
+				},
+			},
+			AuthConfig:      &promauth.Config{},
+			ProxyAuthConfig: &promauth.Config{},
+			jobNameOriginal: "foo",
+		},
+	})
 }
 
 func equalStaticConfigForScrapeWorks(a, b []*ScrapeWork) bool {
@@ -1662,4 +1879,70 @@ func equalStaticConfigForScrapeWorks(a, b []*ScrapeWork) bool {
 		}
 	}
 	return true
+}
+
+func TestScrapeConfigClone(t *testing.T) {
+	f := func(sc *ScrapeConfig) {
+		t.Helper()
+		scCopy := sc.clone()
+		if !reflect.DeepEqual(sc, scCopy) {
+			t.Fatalf("unexpected result after unmarshalJSON() for JSON:\n%s", sc.marshalJSON())
+		}
+	}
+
+	f(&ScrapeConfig{})
+
+	bFalse := false
+	var ie promrelabel.IfExpression
+	if err := ie.Parse(`{foo=~"bar",baz!="z"}`); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	f(&ScrapeConfig{
+		JobName:         "foo",
+		ScrapeInterval:  promutils.NewDuration(time.Second * 47),
+		HonorLabels:     true,
+		HonorTimestamps: &bFalse,
+		Params: map[string][]string{
+			"foo": {"bar", "baz"},
+		},
+		HTTPClientConfig: promauth.HTTPClientConfig{
+			Authorization: &promauth.Authorization{
+				Credentials: promauth.NewSecret("foo"),
+			},
+			BasicAuth: &promauth.BasicAuthConfig{
+				Username: "user_x",
+				Password: promauth.NewSecret("pass_x"),
+			},
+			BearerToken: promauth.NewSecret("zx"),
+			OAuth2: &promauth.OAuth2Config{
+				ClientSecret: promauth.NewSecret("aa"),
+				Scopes:       []string{"foo", "bar"},
+				TLSConfig: &promauth.TLSConfig{
+					CertFile: "foo",
+				},
+			},
+			TLSConfig: &promauth.TLSConfig{
+				KeyFile: "aaa",
+			},
+		},
+		ProxyURL: proxy.MustNewURL("https://foo.bar:3434/assdf/dsfd?sdf=dsf"),
+		RelabelConfigs: []promrelabel.RelabelConfig{{
+			SourceLabels: []string{"foo", "aaa"},
+			Regex: &promrelabel.MultiLineRegex{
+				S: "foo\nbar",
+			},
+			If: &ie,
+		}},
+		SampleLimit: 10,
+		GCESDConfigs: []gce.SDConfig{{
+			Project: "foo",
+			Zone: gce.ZoneYAML{
+				Zones: []string{"a", "b"},
+			},
+		}},
+		StreamParse: true,
+		ProxyClientConfig: promauth.ProxyClientConfig{
+			BearerTokenFile: "foo",
+		},
+	})
 }

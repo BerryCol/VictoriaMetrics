@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/awsapi"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/persistentqueue"
@@ -19,46 +20,48 @@ import (
 )
 
 var (
-	rateLimit = flagutil.NewArrayInt("remoteWrite.rateLimit", "Optional rate limit in bytes per second for data sent to -remoteWrite.url. "+
+	rateLimit = flagutil.NewArrayInt("remoteWrite.rateLimit", "Optional rate limit in bytes per second for data sent to the corresponding -remoteWrite.url. "+
 		"By default the rate limit is disabled. It can be useful for limiting load on remote storage when big amounts of buffered data "+
 		"is sent after temporary unavailability of the remote storage")
-	sendTimeout = flagutil.NewArrayDuration("remoteWrite.sendTimeout", "Timeout for sending a single block of data to -remoteWrite.url")
-	proxyURL    = flagutil.NewArray("remoteWrite.proxyURL", "Optional proxy URL for writing data to -remoteWrite.url. Supported proxies: http, https, socks5. "+
-		"Example: -remoteWrite.proxyURL=socks5://proxy:1234")
+	sendTimeout = flagutil.NewArrayDuration("remoteWrite.sendTimeout", "Timeout for sending a single block of data to the corresponding -remoteWrite.url")
+	proxyURL    = flagutil.NewArray("remoteWrite.proxyURL", "Optional proxy URL for writing data to the corresponding -remoteWrite.url. "+
+		"Supported proxies: http, https, socks5. Example: -remoteWrite.proxyURL=socks5://proxy:1234")
 
-	tlsInsecureSkipVerify = flagutil.NewArrayBool("remoteWrite.tlsInsecureSkipVerify", "Whether to skip tls verification when connecting to -remoteWrite.url")
-	tlsCertFile           = flagutil.NewArray("remoteWrite.tlsCertFile", "Optional path to client-side TLS certificate file to use when connecting to -remoteWrite.url. "+
-		"If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
-	tlsKeyFile = flagutil.NewArray("remoteWrite.tlsKeyFile", "Optional path to client-side TLS certificate key to use when connecting to -remoteWrite.url. "+
-		"If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
-	tlsCAFile = flagutil.NewArray("remoteWrite.tlsCAFile", "Optional path to TLS CA file to use for verifying connections to -remoteWrite.url. "+
-		"By default system CA is used. If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
-	tlsServerName = flagutil.NewArray("remoteWrite.tlsServerName", "Optional TLS server name to use for connections to -remoteWrite.url. "+
-		"By default the server name from -remoteWrite.url is used. If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
+	tlsInsecureSkipVerify = flagutil.NewArrayBool("remoteWrite.tlsInsecureSkipVerify", "Whether to skip tls verification when connecting to the corresponding -remoteWrite.url")
+	tlsCertFile           = flagutil.NewArray("remoteWrite.tlsCertFile", "Optional path to client-side TLS certificate file to use when connecting "+
+		"to the corresponding -remoteWrite.url")
+	tlsKeyFile = flagutil.NewArray("remoteWrite.tlsKeyFile", "Optional path to client-side TLS certificate key to use when connecting to the corresponding -remoteWrite.url")
+	tlsCAFile  = flagutil.NewArray("remoteWrite.tlsCAFile", "Optional path to TLS CA file to use for verifying connections to the corresponding -remoteWrite.url. "+
+		"By default system CA is used")
+	tlsServerName = flagutil.NewArray("remoteWrite.tlsServerName", "Optional TLS server name to use for connections to the corresponding -remoteWrite.url. "+
+		"By default the server name from -remoteWrite.url is used")
 
-	basicAuthUsername = flagutil.NewArray("remoteWrite.basicAuth.username", "Optional basic auth username to use for -remoteWrite.url. "+
-		"If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
-	basicAuthPassword = flagutil.NewArray("remoteWrite.basicAuth.password", "Optional basic auth password to use for -remoteWrite.url. "+
-		"If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
-	basicAuthPasswordFile = flagutil.NewArray("remoteWrite.basicAuth.passwordFile", "Optional path to basic auth password to use for -remoteWrite.url. "+
-		"The file is re-read every second. "+
-		"If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
-	bearerToken = flagutil.NewArray("remoteWrite.bearerToken", "Optional bearer auth token to use for -remoteWrite.url. "+
-		"If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
-	bearerTokenFile = flagutil.NewArray("remoteWrite.bearerTokenFile", "Optional path to bearer token file to use for -remoteWrite.url. "+
-		"The token is re-read from the file every second. "+
-		"If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
+	headers = flagutil.NewArray("remoteWrite.headers", "Optional HTTP headers to send with each request to the corresponding -remoteWrite.url. "+
+		"For example, -remoteWrite.headers='My-Auth:foobar' would send 'My-Auth: foobar' HTTP header with every request to the corresponding -remoteWrite.url. "+
+		"Multiple headers must be delimited by '^^': -remoteWrite.headers='header1:value1^^header2:value2'")
 
-	oauth2ClientID = flagutil.NewArray("remoteWrite.oauth2.clientID", "Optional OAuth2 clientID to use for -remoteWrite.url. "+
-		"If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
-	oauth2ClientSecret = flagutil.NewArray("remoteWrite.oauth2.clientSecret", "Optional OAuth2 clientSecret to use for -remoteWrite.url. "+
-		"If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
-	oauth2ClientSecretFile = flagutil.NewArray("remoteWrite.oauth2.clientSecretFile", "Optional OAuth2 clientSecretFile to use for -remoteWrite.url. "+
-		"If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
-	oauth2TokenURL = flagutil.NewArray("remoteWrite.oauth2.tokenUrl", "Optional OAuth2 tokenURL to use for -remoteWrite.url. "+
-		"If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
-	oauth2Scopes = flagutil.NewArray("remoteWrite.oauth2.scopes", "Optional OAuth2 scopes to use for -remoteWrite.url. Scopes must be delimited by ';'. "+
-		"If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url")
+	basicAuthUsername     = flagutil.NewArray("remoteWrite.basicAuth.username", "Optional basic auth username to use for the corresponding -remoteWrite.url")
+	basicAuthPassword     = flagutil.NewArray("remoteWrite.basicAuth.password", "Optional basic auth password to use for the corresponding -remoteWrite.url")
+	basicAuthPasswordFile = flagutil.NewArray("remoteWrite.basicAuth.passwordFile", "Optional path to basic auth password to use for the corresponding -remoteWrite.url. "+
+		"The file is re-read every second")
+	bearerToken     = flagutil.NewArray("remoteWrite.bearerToken", "Optional bearer auth token to use for the corresponding -remoteWrite.url")
+	bearerTokenFile = flagutil.NewArray("remoteWrite.bearerTokenFile", "Optional path to bearer token file to use for the corresponding -remoteWrite.url. "+
+		"The token is re-read from the file every second")
+
+	oauth2ClientID         = flagutil.NewArray("remoteWrite.oauth2.clientID", "Optional OAuth2 clientID to use for the corresponding -remoteWrite.url")
+	oauth2ClientSecret     = flagutil.NewArray("remoteWrite.oauth2.clientSecret", "Optional OAuth2 clientSecret to use for the corresponding -remoteWrite.url")
+	oauth2ClientSecretFile = flagutil.NewArray("remoteWrite.oauth2.clientSecretFile", "Optional OAuth2 clientSecretFile to use for the corresponding -remoteWrite.url")
+	oauth2TokenURL         = flagutil.NewArray("remoteWrite.oauth2.tokenUrl", "Optional OAuth2 tokenURL to use for the corresponding -remoteWrite.url")
+	oauth2Scopes           = flagutil.NewArray("remoteWrite.oauth2.scopes", "Optional OAuth2 scopes to use for the corresponding -remoteWrite.url. Scopes must be delimited by ';'")
+
+	awsUseSigv4 = flagutil.NewArrayBool("remoteWrite.aws.useSigv4", "Enables SigV4 request signing for the corresponding -remoteWrite.url. "+
+		"It is expected that other -remoteWrite.aws.* command-line flags are set if sigv4 request signing is enabled")
+	awsRegion    = flagutil.NewArray("remoteWrite.aws.region", "Optional AWS region to use for the corresponding -remoteWrite.url if -remoteWrite.aws.useSigv4 is set")
+	awsRoleARN   = flagutil.NewArray("remoteWrite.aws.roleARN", "Optional AWS roleARN to use for the corresponding -remoteWrite.url if -remoteWrite.aws.useSigv4 is set")
+	awsAccessKey = flagutil.NewArray("remoteWrite.aws.accessKey", "Optional AWS AccessKey to use for the corresponding -remoteWrite.url if -remoteWrite.aws.useSigv4 is set")
+	awsService   = flagutil.NewArray("remoteWrite.aws.serice", "Optional AWS Service to use for the corresponding -remoteWrite.url if -remoteWrite.aws.useSigv4 is set. "+
+		"Defaults to \"aps\"")
+	awsSecretKey = flagutil.NewArray("remoteWrite.aws.secretKey", "Optional AWS SecretKey to use for the corresponding -remoteWrite.url if -remoteWrite.aws.useSigv4 is set")
 )
 
 type client struct {
@@ -69,6 +72,7 @@ type client struct {
 
 	sendBlock func(block []byte) bool
 	authCfg   *promauth.Config
+	awsCfg    *awsapi.Config
 
 	rl rateLimiter
 
@@ -78,6 +82,7 @@ type client struct {
 	requestsOKCount *metrics.Counter
 	errorsCount     *metrics.Counter
 	packetsDropped  *metrics.Counter
+	rateLimit       *metrics.Gauge
 	retriesCount    *metrics.Counter
 	sendDuration    *metrics.FloatCounter
 
@@ -88,13 +93,17 @@ type client struct {
 func newHTTPClient(argIdx int, remoteWriteURL, sanitizedURL string, fq *persistentqueue.FastQueue, concurrency int) *client {
 	authCfg, err := getAuthConfig(argIdx)
 	if err != nil {
-		logger.Panicf("FATAL: cannot initialize auth config: %s", err)
+		logger.Panicf("FATAL: cannot initialize auth config for remoteWrite.url=%q: %s", remoteWriteURL, err)
 	}
 	tlsCfg := authCfg.NewTLSConfig()
+	awsCfg, err := getAWSAPIConfig(argIdx)
+	if err != nil {
+		logger.Fatalf("FATAL: cannot initialize AWS Config for remoteWrite.url=%q: %s", remoteWriteURL, err)
+	}
 	tr := &http.Transport{
-		Dial:                statDial,
+		DialContext:         statDial,
 		TLSClientConfig:     tlsCfg,
-		TLSHandshakeTimeout: 5 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
 		MaxConnsPerHost:     2 * concurrency,
 		MaxIdleConnsPerHost: 2 * concurrency,
 		IdleConnTimeout:     time.Minute,
@@ -115,6 +124,7 @@ func newHTTPClient(argIdx int, remoteWriteURL, sanitizedURL string, fq *persiste
 		sanitizedURL:   sanitizedURL,
 		remoteWriteURL: remoteWriteURL,
 		authCfg:        authCfg,
+		awsCfg:         awsCfg,
 		fq:             fq,
 		hc: &http.Client{
 			Transport: tr,
@@ -131,10 +141,13 @@ func (c *client) init(argIdx, concurrency int, sanitizedURL string) {
 		logger.Infof("applying %d bytes per second rate limit for -remoteWrite.url=%q", bytesPerSec, sanitizedURL)
 		c.rl.perSecondLimit = int64(bytesPerSec)
 	}
-	c.rl.limitReached = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remote_write_rate_limit_reached_total{url=%q}`, c.sanitizedURL))
+	c.rl.limitReached = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_rate_limit_reached_total{url=%q}`, c.sanitizedURL))
 
 	c.bytesSent = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_bytes_sent_total{url=%q}`, c.sanitizedURL))
 	c.blocksSent = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_blocks_sent_total{url=%q}`, c.sanitizedURL))
+	c.rateLimit = metrics.GetOrCreateGauge(fmt.Sprintf(`vmagent_remotewrite_rate_limit{url=%q}`, c.sanitizedURL), func() float64 {
+		return float64(rateLimit.GetOptionalArgOrDefault(argIdx, 0))
+	})
 	c.requestDuration = metrics.GetOrCreateHistogram(fmt.Sprintf(`vmagent_remotewrite_duration_seconds{url=%q}`, c.sanitizedURL))
 	c.requestsOKCount = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_requests_total{url=%q, status_code="2XX"}`, c.sanitizedURL))
 	c.errorsCount = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_errors_total{url=%q}`, c.sanitizedURL))
@@ -158,6 +171,11 @@ func (c *client) MustStop() {
 }
 
 func getAuthConfig(argIdx int) (*promauth.Config, error) {
+	headersValue := headers.GetOptionalArg(argIdx)
+	var hdrs []string
+	if headersValue != "" {
+		hdrs = strings.Split(headersValue, "^^")
+	}
 	username := basicAuthUsername.GetOptionalArg(argIdx)
 	password := basicAuthPassword.GetOptionalArg(argIdx)
 	passwordFile := basicAuthPasswordFile.GetOptionalArg(argIdx)
@@ -194,11 +212,35 @@ func getAuthConfig(argIdx int) (*promauth.Config, error) {
 		InsecureSkipVerify: tlsInsecureSkipVerify.GetOptionalArg(argIdx),
 	}
 
-	authCfg, err := promauth.NewConfig(".", nil, basicAuthCfg, token, tokenFile, oauth2Cfg, tlsCfg)
+	opts := &promauth.Options{
+		BasicAuth:       basicAuthCfg,
+		BearerToken:     token,
+		BearerTokenFile: tokenFile,
+		OAuth2:          oauth2Cfg,
+		TLSConfig:       tlsCfg,
+		Headers:         hdrs,
+	}
+	authCfg, err := opts.NewConfig()
 	if err != nil {
 		return nil, fmt.Errorf("cannot populate OAuth2 config for remoteWrite idx: %d, err: %w", argIdx, err)
 	}
 	return authCfg, nil
+}
+
+func getAWSAPIConfig(argIdx int) (*awsapi.Config, error) {
+	if !awsUseSigv4.GetOptionalArg(argIdx) {
+		return nil, nil
+	}
+	region := awsRegion.GetOptionalArg(argIdx)
+	roleARN := awsRoleARN.GetOptionalArg(argIdx)
+	accessKey := awsAccessKey.GetOptionalArg(argIdx)
+	secretKey := awsSecretKey.GetOptionalArg(argIdx)
+	service := awsService.GetOptionalArg(argIdx)
+	cfg, err := awsapi.NewConfig(region, roleARN, accessKey, secretKey, service)
+	if err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 func (c *client) runWorker() {
@@ -250,21 +292,28 @@ func (c *client) sendBlockHTTP(block []byte) bool {
 	retriesCount := 0
 	c.bytesSent.Add(len(block))
 	c.blocksSent.Inc()
+	sigv4Hash := ""
+	if c.awsCfg != nil {
+		sigv4Hash = awsapi.HashHex(block)
+	}
 
 again:
 	req, err := http.NewRequest("POST", c.remoteWriteURL, bytes.NewBuffer(block))
 	if err != nil {
 		logger.Panicf("BUG: unexpected error from http.NewRequest(%q): %s", c.sanitizedURL, err)
 	}
+	c.authCfg.SetHeaders(req, true)
 	h := req.Header
 	h.Set("User-Agent", "vmagent")
 	h.Set("Content-Type", "application/x-protobuf")
 	h.Set("Content-Encoding", "snappy")
 	h.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
-	if ah := c.authCfg.GetAuthHeader(); ah != "" {
-		req.Header.Set("Authorization", ah)
+	if c.awsCfg != nil {
+		if err := c.awsCfg.SignRequest(req, sigv4Hash); err != nil {
+			// there is no need in retry, request will be rejected by client.Do and retried by code below
+			logger.Warnf("cannot sign remoteWrite request with AWS sigv4: %s", err)
+		}
 	}
-
 	startTime := time.Now()
 	resp, err := c.hc.Do(req)
 	c.requestDuration.UpdateDuration(startTime)
@@ -297,13 +346,12 @@ again:
 	if statusCode == 409 || statusCode == 400 {
 		body, err := ioutil.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		l := logger.WithThrottler("remoteWriteRejected", 5*time.Second)
 		if err != nil {
-			l.Errorf("sending a block with size %d bytes to %q was rejected (skipping the block): status code %d; "+
+			remoteWriteRejectedLogger.Errorf("sending a block with size %d bytes to %q was rejected (skipping the block): status code %d; "+
 				"failed to read response body: %s",
 				len(block), c.sanitizedURL, statusCode, err)
 		} else {
-			l.Errorf("sending a block with size %d bytes to %q was rejected (skipping the block): status code %d; response body: %s",
+			remoteWriteRejectedLogger.Errorf("sending a block with size %d bytes to %q was rejected (skipping the block): status code %d; response body: %s",
 				len(block), c.sanitizedURL, statusCode, string(body))
 		}
 		// Just drop block on 409 and 400 status codes like Prometheus does.
@@ -339,6 +387,8 @@ again:
 	c.retriesCount.Inc()
 	goto again
 }
+
+var remoteWriteRejectedLogger = logger.WithThrottler("remoteWriteRejected", 5*time.Second)
 
 type rateLimiter struct {
 	perSecondLimit int64

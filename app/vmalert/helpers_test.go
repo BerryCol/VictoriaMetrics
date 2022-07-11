@@ -44,10 +44,10 @@ func (fq *fakeQuerier) BuildWithParams(_ datasource.QuerierParams) datasource.Qu
 }
 
 func (fq *fakeQuerier) QueryRange(ctx context.Context, q string, _, _ time.Time) ([]datasource.Metric, error) {
-	return fq.Query(ctx, q)
+	return fq.Query(ctx, q, time.Now())
 }
 
-func (fq *fakeQuerier) Query(_ context.Context, _ string) ([]datasource.Metric, error) {
+func (fq *fakeQuerier) Query(_ context.Context, _ string, _ time.Time) ([]datasource.Metric, error) {
 	fq.Lock()
 	defer fq.Unlock()
 	if fq.err != nil {
@@ -61,20 +61,42 @@ func (fq *fakeQuerier) Query(_ context.Context, _ string) ([]datasource.Metric, 
 type fakeNotifier struct {
 	sync.Mutex
 	alerts []notifier.Alert
+	// records number of received alerts in total
+	counter int
 }
 
+func (*fakeNotifier) Close()       {}
 func (*fakeNotifier) Addr() string { return "" }
 func (fn *fakeNotifier) Send(_ context.Context, alerts []notifier.Alert) error {
 	fn.Lock()
 	defer fn.Unlock()
+	fn.counter += len(alerts)
 	fn.alerts = alerts
 	return nil
+}
+
+func (fn *fakeNotifier) getCounter() int {
+	fn.Lock()
+	defer fn.Unlock()
+	return fn.counter
 }
 
 func (fn *fakeNotifier) getAlerts() []notifier.Alert {
 	fn.Lock()
 	defer fn.Unlock()
 	return fn.alerts
+}
+
+type faultyNotifier struct {
+	fakeNotifier
+}
+
+func (fn *faultyNotifier) Send(ctx context.Context, _ []notifier.Alert) error {
+	d, ok := ctx.Deadline()
+	if ok {
+		time.Sleep(time.Until(d))
+	}
+	return fmt.Errorf("send failed")
 }
 
 func metricWithValueAndLabels(t *testing.T, value float64, labels ...string) datasource.Metric {
@@ -104,6 +126,21 @@ func metricWithLabels(t *testing.T, labels ...string) datasource.Metric {
 		})
 	}
 	return m
+}
+
+func toPromLabels(t *testing.T, labels ...string) []prompbmarshal.Label {
+	t.Helper()
+	if len(labels) == 0 || len(labels)%2 != 0 {
+		t.Fatalf("expected to get even number of labels")
+	}
+	var ls []prompbmarshal.Label
+	for i := 0; i < len(labels); i += 2 {
+		ls = append(ls, prompbmarshal.Label{
+			Name:  labels[i],
+			Value: labels[i+1],
+		})
+	}
+	return ls
 }
 
 func compareGroups(t *testing.T, a, b *Group) {

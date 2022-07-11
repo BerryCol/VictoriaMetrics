@@ -28,7 +28,8 @@ const THEME = createTheme({
         root: {
           fontSize: "12px",
           letterSpacing: "normal",
-          lineHeight: "1"
+          lineHeight: "1",
+          zIndex: 0
         }
       }
     },
@@ -98,6 +99,7 @@ const THEME = createTheme({
     MuiAlert: {
       styleOverrides: {
         root: {
+          fontSize: "14px",
           boxShadow: "rgba(0, 0, 0, 0.08) 0px 4px 12px"
         }
       }

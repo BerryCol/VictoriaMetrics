@@ -11,7 +11,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/VictoriaMetrics/metricsql"
-	xxhash "github.com/cespare/xxhash/v2"
+	"github.com/cespare/xxhash/v2"
 )
 
 var aggrFuncs = map[string]aggrFunc{
@@ -619,7 +619,7 @@ func newAggrFuncTopK(isReverse bool) aggrFunc {
 				})
 				fillNaNsAtIdx(n, ks[n], tss)
 			}
-			tss = removeNaNs(tss)
+			tss = removeEmptySeries(tss)
 			reverseSeries(tss)
 			return tss
 		}
@@ -686,7 +686,7 @@ func getRangeTopKTimeseries(tss []*timeseries, modifier *metricsql.ModifierExpr,
 	if remainingSumTS != nil {
 		tss = append(tss, remainingSumTS)
 	}
-	tss = removeNaNs(tss)
+	tss = removeEmptySeries(tss)
 	reverseSeries(tss)
 	return tss
 }

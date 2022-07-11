@@ -10,18 +10,19 @@ import (
 	"gopkg.in/yaml.v2"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/templates"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
 func TestMain(m *testing.M) {
-	u, _ := url.Parse("https://victoriametrics.com/path")
-	notifier.InitTemplateFunc(u)
+	if err := templates.Load([]string{"testdata/templates/*good.tmpl"}, true); err != nil {
+		os.Exit(1)
+	}
 	os.Exit(m.Run())
 }
 
 func TestParseGood(t *testing.T) {
-	if _, err := Parse([]string{"testdata/*good.rules", "testdata/dir/*good.*"}, true, true); err != nil {
+	if _, err := Parse([]string{"testdata/rules/*good.rules", "testdata/dir/*good.*"}, true, true); err != nil {
 		t.Errorf("error parsing files %s", err)
 	}
 }
@@ -32,7 +33,7 @@ func TestParseBad(t *testing.T) {
 		expErr string
 	}{
 		{
-			[]string{"testdata/rules0-bad.rules"},
+			[]string{"testdata/rules/rules0-bad.rules"},
 			"unexpected token",
 		},
 		{
@@ -56,7 +57,7 @@ func TestParseBad(t *testing.T) {
 			"either `record` or `alert` must be set",
 		},
 		{
-			[]string{"testdata/rules1-bad.rules"},
+			[]string{"testdata/rules/rules1-bad.rules"},
 			"bad graphite expr",
 		},
 	}
@@ -260,7 +261,7 @@ func TestGroup_Validate(t *testing.T) {
 				Rules: []Rule{
 					{
 						Expr: "sumSeries(time('foo.bar',10))",
-						For:  utils.NewPromDuration(10 * time.Millisecond),
+						For:  promutils.NewDuration(10 * time.Millisecond),
 					},
 					{
 						Expr: "sum(up == 0 ) by (host)",
@@ -275,7 +276,7 @@ func TestGroup_Validate(t *testing.T) {
 				Rules: []Rule{
 					{
 						Expr: "sum(up == 0 ) by (host)",
-						For:  utils.NewPromDuration(10 * time.Millisecond),
+						For:  promutils.NewDuration(10 * time.Millisecond),
 					},
 					{
 						Expr: "sumSeries(time('foo.bar',10))",
@@ -342,7 +343,7 @@ func TestHashRule(t *testing.T) {
 			true,
 		},
 		{
-			Rule{Alert: "alert", Expr: "up == 1", For: utils.NewPromDuration(time.Minute)},
+			Rule{Alert: "alert", Expr: "up == 1", For: promutils.NewDuration(time.Minute)},
 			Rule{Alert: "alert", Expr: "up == 1"},
 			true,
 		},
@@ -488,6 +489,22 @@ rules:
 name: TestGroup
 params:
     nocache: ["0"]
+rules:
+  - alert: foo
+    expr: sum by(job) (up == 1)
+`)
+	})
+
+	t.Run("`limit` change", func(t *testing.T) {
+		f(t, `
+name: TestGroup
+limit: 5
+rules:
+  - alert: foo
+    expr: sum by(job) (up == 1)
+`, `
+name: TestGroup
+limit: 10
 rules:
   - alert: foo
     expr: sum by(job) (up == 1)

@@ -35,7 +35,7 @@ var (
 		"The path can point to local file and to http url. "+
 		"See https://docs.victoriametrics.com/#how-to-scrape-prometheus-exporters-such-as-node-exporter for details")
 
-	fileSDCheckInterval = flag.Duration("promscrape.fileSDCheckInterval", 30*time.Second, "Interval for checking for changes in 'file_sd_config'. "+
+	fileSDCheckInterval = flag.Duration("promscrape.fileSDCheckInterval", 5*time.Minute, "Interval for checking for changes in 'file_sd_config'. "+
 		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#file_sd_config for details")
 )
 
@@ -52,6 +52,7 @@ func CheckConfig() error {
 //
 // Scraped data is passed to pushData.
 func Init(pushData func(wr *prompbmarshal.WriteRequest)) {
+	mustInitClusterMemberID()
 	globalStopChan = make(chan struct{})
 	scraperWG.Add(1)
 	go func() {
@@ -144,8 +145,7 @@ func runScraper(configFile string, pushData func(wr *prompbmarshal.WriteRequest)
 				logger.Infof("nothing changed in %q", configFile)
 				goto waitForChans
 			}
-			cfg.mustStop()
-			cfgNew.mustStart()
+			cfgNew.mustRestart(cfg)
 			cfg = cfgNew
 			data = dataNew
 			marshaledData = cfgNew.marshal()
@@ -160,10 +160,10 @@ func runScraper(configFile string, pushData func(wr *prompbmarshal.WriteRequest)
 				// Nothing changed since the previous loadConfig
 				goto waitForChans
 			}
-			cfg.mustStop()
-			cfgNew.mustStart()
+			cfgNew.mustRestart(cfg)
 			cfg = cfgNew
 			data = dataNew
+			marshaledData = cfgNew.marshal()
 			configData.Store(&marshaledData)
 		case <-globalStopCh:
 			cfg.mustStop()
@@ -257,7 +257,11 @@ func (scfg *scrapeConfig) run(globalStopCh <-chan struct{}) {
 		sws := scfg.getScrapeWork(cfg, swsPrev)
 		sg.update(sws)
 		swsPrev = sws
-		scfg.discoveryDuration.UpdateDuration(startTime)
+		if sg.scrapersStarted.Get() > 0 {
+			// update duration only if at least one scraper has started
+			// otherwise this SD is considered as inactive
+			scfg.discoveryDuration.UpdateDuration(startTime)
+		}
 	}
 	updateScrapeWork(cfg)
 	atomic.AddInt32(&PendingScrapeConfigs, -1)
@@ -373,14 +377,14 @@ func (sg *scraperGroup) update(sws []*ScrapeWork) {
 		sg.activeScrapers.Inc()
 		sg.scrapersStarted.Inc()
 		sg.wg.Add(1)
-		tsmGlobal.Register(sw)
+		tsmGlobal.Register(&sc.sw)
 		go func(sw *ScrapeWork) {
 			defer func() {
 				sg.wg.Done()
 				close(sc.stoppedCh)
 			}()
 			sc.sw.run(sc.stopCh, sg.globalStopCh)
-			tsmGlobal.Unregister(sw)
+			tsmGlobal.Unregister(&sc.sw)
 			sg.activeScrapers.Dec()
 			sg.scrapersStopped.Inc()
 		}(sw)

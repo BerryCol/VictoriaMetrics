@@ -75,10 +75,12 @@ type Table struct {
 	// aligned to 8 bytes on 32-bit architectures.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/212
 
-	activeMerges   uint64
-	mergesCount    uint64
-	itemsMerged    uint64
-	assistedMerges uint64
+	activeMerges        uint64
+	mergesCount         uint64
+	itemsMerged         uint64
+	assistedMerges      uint64
+	itemsAdded          uint64
+	itemsAddedSizeBytes uint64
 
 	mergeIdx uint64
 
@@ -89,6 +91,7 @@ type Table struct {
 	needFlushCallbackCall uint32
 
 	prepareBlock PrepareBlockCallback
+	isReadOnly   *uint32
 
 	partsLock sync.Mutex
 	parts     []*partWrapper
@@ -125,9 +128,16 @@ type rawItemsShards struct {
 // The number of shards for rawItems per table.
 //
 // Higher number of shards reduces CPU contention and increases the max bandwidth on multi-core systems.
-var rawItemsShardsPerTable = cgroup.AvailableCPUs()
+var rawItemsShardsPerTable = func() int {
+	cpus := cgroup.AvailableCPUs()
+	multiplier := cpus
+	if multiplier > 16 {
+		multiplier = 16
+	}
+	return (cpus*multiplier + 1) / 2
+}()
 
-const maxBlocksPerShard = 512
+const maxBlocksPerShard = 256
 
 func (riss *rawItemsShards) init() {
 	riss.shards = make([]rawItemsShard, rawItemsShardsPerTable)
@@ -227,7 +237,9 @@ func (pw *partWrapper) decRef() {
 	}
 
 	if pw.mp != nil {
-		putInmemoryPart(pw.mp)
+		// Do not return pw.mp to pool via putInmemoryPart(),
+		// since pw.mp size may be too big compared to other entries stored in the pool.
+		// This may result in increased memory usage because of high fragmentation.
 		pw.mp = nil
 	}
 	pw.p.MustClose()
@@ -243,7 +255,7 @@ func (pw *partWrapper) decRef() {
 // to persistent storage.
 //
 // The table is created if it doesn't exist yet.
-func OpenTable(path string, flushCallback func(), prepareBlock PrepareBlockCallback) (*Table, error) {
+func OpenTable(path string, flushCallback func(), prepareBlock PrepareBlockCallback, isReadOnly *uint32) (*Table, error) {
 	path = filepath.Clean(path)
 	logger.Infof("opening table %q...", path)
 	startTime := time.Now()
@@ -269,6 +281,7 @@ func OpenTable(path string, flushCallback func(), prepareBlock PrepareBlockCallb
 		path:          path,
 		flushCallback: flushCallback,
 		prepareBlock:  prepareBlock,
+		isReadOnly:    isReadOnly,
 		parts:         pws,
 		mergeIdx:      uint64(time.Now().UnixNano()),
 		flockF:        flockF,
@@ -387,10 +400,12 @@ func (tb *Table) Path() string {
 
 // TableMetrics contains essential metrics for the Table.
 type TableMetrics struct {
-	ActiveMerges   uint64
-	MergesCount    uint64
-	ItemsMerged    uint64
-	AssistedMerges uint64
+	ActiveMerges        uint64
+	MergesCount         uint64
+	ItemsMerged         uint64
+	AssistedMerges      uint64
+	ItemsAdded          uint64
+	ItemsAddedSizeBytes uint64
 
 	PendingItems uint64
 
@@ -421,6 +436,8 @@ func (tb *Table) UpdateMetrics(m *TableMetrics) {
 	m.MergesCount += atomic.LoadUint64(&tb.mergesCount)
 	m.ItemsMerged += atomic.LoadUint64(&tb.itemsMerged)
 	m.AssistedMerges += atomic.LoadUint64(&tb.assistedMerges)
+	m.ItemsAdded += atomic.LoadUint64(&tb.itemsAdded)
+	m.ItemsAddedSizeBytes += atomic.LoadUint64(&tb.itemsAddedSizeBytes)
 
 	m.PendingItems += uint64(tb.rawItems.Len())
 
@@ -455,6 +472,12 @@ func (tb *Table) AddItems(items [][]byte) error {
 	if err := tb.rawItems.addItems(tb, items); err != nil {
 		return fmt.Errorf("cannot insert data into %q: %w", tb.path, err)
 	}
+	atomic.AddUint64(&tb.itemsAdded, uint64(len(items)))
+	n := 0
+	for _, item := range items {
+		n += len(item)
+	}
+	atomic.AddUint64(&tb.itemsAddedSizeBytes, uint64(n))
 	return nil
 }
 
@@ -740,7 +763,10 @@ func (tb *Table) mergeInmemoryBlocks(ibs []*inmemoryBlock) *partWrapper {
 
 	// Prepare blockStreamWriter for destination part.
 	bsw := getBlockStreamWriter()
-	mpDst := getInmemoryPart()
+	// Do not obtain mpDst via getInmemoryPart(), since its size
+	// may be too big comparing to other entries in the pool.
+	// This may result in increased memory usage because of high fragmentation.
+	mpDst := &inmemoryPart{}
 	bsw.InitFromInmemoryPart(mpDst)
 
 	// Merge parts.
@@ -775,7 +801,17 @@ func (tb *Table) startPartMergers() {
 	}
 }
 
+func (tb *Table) canBackgroundMerge() bool {
+	return atomic.LoadUint32(tb.isReadOnly) == 0
+}
+
 func (tb *Table) mergeExistingParts(isFinal bool) error {
+	if !tb.canBackgroundMerge() {
+		// Do not perform background merge in read-only mode
+		// in order to prevent from disk space shortage.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2603
+		return nil
+	}
 	n := fs.MustGetFreeSpace(tb.path)
 	// Divide free space by the max number of concurrent merges.
 	maxOutBytes := n / uint64(mergeWorkersCount)

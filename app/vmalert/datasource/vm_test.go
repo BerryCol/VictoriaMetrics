@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 )
 
@@ -36,7 +37,7 @@ func TestVMInstantQuery(t *testing.T) {
 	mux.HandleFunc("/render", func(w http.ResponseWriter, request *http.Request) {
 		c++
 		switch c {
-		case 7:
+		case 8:
 			w.Write([]byte(`[{"target":"constantLine(10)","tags":{"name":"constantLine(10)"},"datapoints":[[10,1611758343],[10,1611758373],[10,1611758403]]}]`))
 		}
 	})
@@ -74,40 +75,38 @@ func TestVMInstantQuery(t *testing.T) {
 			w.Write([]byte(`{"status":"success","data":{"resultType":"matrix"}}`))
 		case 6:
 			w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__name__":"vm_rows"},"value":[1583786142,"13763"]},{"metric":{"__name__":"vm_requests"},"value":[1583786140,"2000"]}]}}`))
+		case 7:
+			w.Write([]byte(`{"status":"success","data":{"resultType":"scalar","result":[1583786142, "1"]}}`))
 		}
 	})
 
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	authCfg, err := promauth.NewConfig(".", nil, baCfg, "", "", nil, nil)
+	authCfg, err := baCfg.NewConfig(".")
 	if err != nil {
 		t.Fatalf("unexpected: %s", err)
 	}
-	s := NewVMStorage(srv.URL, authCfg, time.Minute, 0, false, srv.Client(), false)
+	s := NewVMStorage(srv.URL, authCfg, time.Minute, 0, false, srv.Client())
 
 	p := NewPrometheusType()
 	pq := s.BuildWithParams(QuerierParams{DataSourceType: &p, EvaluationInterval: 15 * time.Second})
+	ts := time.Now()
 
-	if _, err := pq.Query(ctx, query); err == nil {
-		t.Fatalf("expected connection error got nil")
+	expErr := func(err string) {
+		if _, err := pq.Query(ctx, query, ts); err == nil {
+			t.Fatalf("expected %q got nil", err)
+		}
 	}
-	if _, err := pq.Query(ctx, query); err == nil {
-		t.Fatalf("expected invalid response status error got nil")
-	}
-	if _, err := pq.Query(ctx, query); err == nil {
-		t.Fatalf("expected response body error got nil")
-	}
-	if _, err := pq.Query(ctx, query); err == nil {
-		t.Fatalf("expected error status got nil")
-	}
-	if _, err := pq.Query(ctx, query); err == nil {
-		t.Fatalf("expected unknown status got nil")
-	}
-	if _, err := pq.Query(ctx, query); err == nil {
-		t.Fatalf("expected non-vector resultType error  got nil")
-	}
-	m, err := pq.Query(ctx, query)
+
+	expErr("connection error")              // 0
+	expErr("invalid response status error") // 1
+	expErr("response body error")           // 2
+	expErr("error status")                  // 3
+	expErr("unknown status")                // 4
+	expErr("non-vector resultType error")   // 5
+
+	m, err := pq.Query(ctx, query, ts) // 6 - vector
 	if err != nil {
 		t.Fatalf("unexpected %s", err)
 	}
@@ -130,10 +129,27 @@ func TestVMInstantQuery(t *testing.T) {
 		t.Fatalf("unexpected metric %+v want %+v", m, expected)
 	}
 
+	m, err = pq.Query(ctx, query, ts) // 7 - scalar
+	if err != nil {
+		t.Fatalf("unexpected %s", err)
+	}
+	if len(m) != 1 {
+		t.Fatalf("expected 1 metrics got %d in %+v", len(m), m)
+	}
+	expected = []Metric{
+		{
+			Timestamps: []int64{1583786142},
+			Values:     []float64{1},
+		},
+	}
+	if !reflect.DeepEqual(m, expected) {
+		t.Fatalf("unexpected metric %+v want %+v", m, expected)
+	}
+
 	g := NewGraphiteType()
 	gq := s.BuildWithParams(QuerierParams{DataSourceType: &g})
 
-	m, err = gq.Query(ctx, queryRender)
+	m, err = gq.Query(ctx, queryRender, ts) // 8 - graphite
 	if err != nil {
 		t.Fatalf("unexpected %s", err)
 	}
@@ -190,11 +206,11 @@ func TestVMRangeQuery(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	authCfg, err := promauth.NewConfig(".", nil, baCfg, "", "", nil, nil)
+	authCfg, err := baCfg.NewConfig(".")
 	if err != nil {
 		t.Fatalf("unexpected: %s", err)
 	}
-	s := NewVMStorage(srv.URL, authCfg, time.Minute, 0, false, srv.Client(), false)
+	s := NewVMStorage(srv.URL, authCfg, time.Minute, 0, false, srv.Client())
 
 	p := NewPrometheusType()
 	pq := s.BuildWithParams(QuerierParams{DataSourceType: &p, EvaluationInterval: 15 * time.Second})
@@ -231,7 +247,7 @@ func TestVMRangeQuery(t *testing.T) {
 }
 
 func TestRequestParams(t *testing.T) {
-	authCfg, err := promauth.NewConfig(".", nil, baCfg, "", "", nil, nil)
+	authCfg, err := baCfg.NewConfig(".")
 	if err != nil {
 		t.Fatalf("unexpected: %s", err)
 	}
@@ -250,18 +266,7 @@ func TestRequestParams(t *testing.T) {
 				dataSourceType: NewPrometheusType(),
 			},
 			func(t *testing.T, r *http.Request) {
-				checkEqualString(t, prometheusInstantPath, r.URL.Path)
-			},
-		},
-		{
-			"prometheus path with disablePathAppend",
-			false,
-			&VMStorage{
-				dataSourceType:    NewPrometheusType(),
-				disablePathAppend: true,
-			},
-			func(t *testing.T, r *http.Request) {
-				checkEqualString(t, "", r.URL.Path)
+				checkEqualString(t, "/api/v1/query", r.URL.Path)
 			},
 		},
 		{
@@ -272,19 +277,7 @@ func TestRequestParams(t *testing.T) {
 				appendTypePrefix: true,
 			},
 			func(t *testing.T, r *http.Request) {
-				checkEqualString(t, prometheusPrefix+prometheusInstantPath, r.URL.Path)
-			},
-		},
-		{
-			"prometheus prefix with disablePathAppend",
-			false,
-			&VMStorage{
-				dataSourceType:    NewPrometheusType(),
-				appendTypePrefix:  true,
-				disablePathAppend: true,
-			},
-			func(t *testing.T, r *http.Request) {
-				checkEqualString(t, prometheusPrefix, r.URL.Path)
+				checkEqualString(t, "/prometheus/api/v1/query", r.URL.Path)
 			},
 		},
 		{
@@ -294,18 +287,7 @@ func TestRequestParams(t *testing.T) {
 				dataSourceType: NewPrometheusType(),
 			},
 			func(t *testing.T, r *http.Request) {
-				checkEqualString(t, prometheusRangePath, r.URL.Path)
-			},
-		},
-		{
-			"prometheus range path with disablePathAppend",
-			true,
-			&VMStorage{
-				dataSourceType:    NewPrometheusType(),
-				disablePathAppend: true,
-			},
-			func(t *testing.T, r *http.Request) {
-				checkEqualString(t, "", r.URL.Path)
+				checkEqualString(t, "/api/v1/query_range", r.URL.Path)
 			},
 		},
 		{
@@ -316,19 +298,7 @@ func TestRequestParams(t *testing.T) {
 				appendTypePrefix: true,
 			},
 			func(t *testing.T, r *http.Request) {
-				checkEqualString(t, prometheusPrefix+prometheusRangePath, r.URL.Path)
-			},
-		},
-		{
-			"prometheus range prefix with disablePathAppend",
-			true,
-			&VMStorage{
-				dataSourceType:    NewPrometheusType(),
-				appendTypePrefix:  true,
-				disablePathAppend: true,
-			},
-			func(t *testing.T, r *http.Request) {
-				checkEqualString(t, prometheusPrefix, r.URL.Path)
+				checkEqualString(t, "/prometheus/api/v1/query_range", r.URL.Path)
 			},
 		},
 		{
@@ -513,6 +483,59 @@ func TestRequestParams(t *testing.T) {
 				tc.vm.setGraphiteReqParams(req, query, timestamp)
 			}
 			tc.checkFn(t, req)
+		})
+	}
+}
+
+func TestAuthConfig(t *testing.T) {
+	var testCases = []struct {
+		name    string
+		vmFn    func() *VMStorage
+		checkFn func(t *testing.T, r *http.Request)
+	}{
+		{
+			name: "basic auth",
+			vmFn: func() *VMStorage {
+				cfg, err := utils.AuthConfig(utils.WithBasicAuth("foo", "bar", ""))
+				if err != nil {
+					t.Errorf("Error get auth config: %s", err)
+				}
+				return &VMStorage{authCfg: cfg}
+			},
+			checkFn: func(t *testing.T, r *http.Request) {
+				u, p, _ := r.BasicAuth()
+				checkEqualString(t, "foo", u)
+				checkEqualString(t, "bar", p)
+			},
+		},
+		{
+			name: "bearer auth",
+			vmFn: func() *VMStorage {
+				cfg, err := utils.AuthConfig(utils.WithBearer("foo", ""))
+				if err != nil {
+					t.Errorf("Error get auth config: %s", err)
+				}
+				return &VMStorage{authCfg: cfg}
+			},
+			checkFn: func(t *testing.T, r *http.Request) {
+				reqToken := r.Header.Get("Authorization")
+				splitToken := strings.Split(reqToken, "Bearer ")
+				if len(splitToken) != 2 {
+					t.Errorf("expected two items got %d", len(splitToken))
+				}
+				token := splitToken[1]
+				checkEqualString(t, "foo", token)
+			},
+		},
+	}
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			vm := tt.vmFn()
+			req, err := vm.newRequestPOST()
+			if err != nil {
+				t.Fatalf("unexpected error: %s", err)
+			}
+			tt.checkFn(t, req)
 		})
 	}
 }

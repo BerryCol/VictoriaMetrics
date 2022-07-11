@@ -42,6 +42,7 @@ var transformFuncs = map[string]transformFunc{
 	"day_of_week":          newTransformFuncDateTime(transformDayOfWeek),
 	"days_in_month":        newTransformFuncDateTime(transformDaysInMonth),
 	"deg":                  newTransformFuncOneArg(transformDeg),
+	"drop_common_labels":   transformDropCommonLabels,
 	"end":                  newTransformFuncZeroArgs(transformEnd),
 	"exp":                  newTransformFuncOneArg(transformExp),
 	"floor":                newTransformFuncOneArg(transformFloor),
@@ -993,16 +994,32 @@ func groupLeTimeseries(tss []*timeseries) map[string][]leTimeseries {
 }
 
 func fixBrokenBuckets(i int, xss []leTimeseries) {
-	// Fix broken buckets.
-	// They are already sorted by le, so their values must be in ascending order,
+	// Buckets are already sorted by le, so their values must be in ascending order,
 	// since the next bucket includes all the previous buckets.
-	vPrev := float64(0)
-	for _, xs := range xss {
-		v := xs.ts.Values[i]
-		if v < vPrev || math.IsNaN(v) {
-			xs.ts.Values[i] = vPrev
+	// If the next bucket has lower value than the current bucket,
+	// then the current bucket must be substituted with the next bucket value.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2819
+	if len(xss) < 2 {
+		return
+	}
+	for j := len(xss) - 1; j >= 0; j-- {
+		v := xss[j].ts.Values[i]
+		if !math.IsNaN(v) {
+			j++
+			for j < len(xss) {
+				xss[j].ts.Values[i] = v
+				j++
+			}
+			break
+		}
+	}
+	vNext := xss[len(xss)-1].ts.Values[i]
+	for j := len(xss) - 2; j >= 0; j-- {
+		v := xss[j].ts.Values[i]
+		if math.IsNaN(v) || v > vNext {
+			xss[j].ts.Values[i] = vNext
 		} else {
-			vPrev = v
+			vNext = v
 		}
 	}
 }
@@ -1486,6 +1503,43 @@ func transformLabelMap(tfa *transformFuncArg) ([]*timeseries, error) {
 	return rvs, nil
 }
 
+func transformDropCommonLabels(tfa *transformFuncArg) ([]*timeseries, error) {
+	args := tfa.args
+	if len(args) < 1 {
+		return nil, fmt.Errorf(`not enough args; got %d; want at least %d`, len(args), 1)
+	}
+	rvs := args[0]
+	for _, tss := range args[1:] {
+		rvs = append(rvs, tss...)
+	}
+	m := make(map[string]map[string]int)
+	countLabel := func(name, value string) {
+		x := m[name]
+		if x == nil {
+			x = make(map[string]int)
+			m[name] = x
+		}
+		x[value]++
+	}
+	for _, ts := range rvs {
+		countLabel("__name__", string(ts.MetricName.MetricGroup))
+		for _, tag := range ts.MetricName.Tags {
+			countLabel(string(tag.Key), string(tag.Value))
+		}
+	}
+	for labelName, x := range m {
+		for _, count := range x {
+			if count != len(rvs) {
+				continue
+			}
+			for _, ts := range rvs {
+				ts.MetricName.RemoveTag(labelName)
+			}
+		}
+	}
+	return rvs, nil
+}
+
 func transformLabelCopy(tfa *transformFuncArg) ([]*timeseries, error) {
 	return transformLabelCopyExt(tfa, false)
 }
@@ -1677,8 +1731,10 @@ func transformLabelValue(tfa *transformFuncArg) ([]*timeseries, error) {
 			v = nan
 		}
 		values := ts.Values
-		for i := range values {
-			values[i] = v
+		for i, vOrig := range values {
+			if !math.IsNaN(vOrig) {
+				values[i] = v
+			}
 		}
 	}
 	// Do not remove timeseries with only NaN values, so `default` could be applied to them:
@@ -2122,21 +2178,22 @@ func transformTimezoneOffset(tfa *transformFuncArg) ([]*timeseries, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot get timezone name: %w", err)
 	}
-	tzOffset, err := getTimezoneOffset(tzString)
-	if err != nil {
-		return nil, fmt.Errorf("cannot get timezone offset for %q: %w", tzString, err)
-	}
-	rv := evalNumber(tfa.ec, float64(tzOffset))
-	return rv, nil
-}
-
-func getTimezoneOffset(tzString string) (int, error) {
 	loc, err := time.LoadLocation(tzString)
 	if err != nil {
-		return 0, fmt.Errorf("cannot load timezone %q: %w", tzString, err)
+		return nil, fmt.Errorf("cannot load timezone %q: %w", tzString, err)
 	}
-	_, tzOffset := time.Now().In(loc).Zone()
-	return tzOffset, nil
+
+	var ts timeseries
+	ts.denyReuse = true
+	timestamps := tfa.ec.getSharedTimestamps()
+	values := make([]float64, len(timestamps))
+	for i, v := range timestamps {
+		_, offset := time.Unix(v/1000, 0).In(loc).Zone()
+		values[i] = float64(offset)
+	}
+	ts.Values = values
+	ts.Timestamps = timestamps
+	return []*timeseries{&ts}, nil
 }
 
 func transformTime(tfa *transformFuncArg) ([]*timeseries, error) {
@@ -2289,9 +2346,9 @@ func removeCounterResetsMaybeNaNs(values []float64) {
 		d := v - prevValue
 		if d < 0 {
 			if (-d * 8) < prevValue {
-				// This is likely jitter from `Prometheus HA pairs`.
-				// Just substitute v with prevValue.
-				v = prevValue
+				// This is likely a partial counter reset.
+				// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2787
+				correction += prevValue - v
 			} else {
 				correction += prevValue
 			}
